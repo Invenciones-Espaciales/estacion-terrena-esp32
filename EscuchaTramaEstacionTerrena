@@ -1,0 +1,209 @@
+
+#include <SPI.h>
+#include <LoRa.h>
+
+// ==========================================
+// ESTACION TERRENA - ESP32-C3 SUPER MINI
+// Radio LoRa XL1278-SMT / SX1278
+// ==========================================
+
+// Pines SPI
+const int PIN_SCK  = 4;
+const int PIN_MISO = 5;
+const int PIN_MOSI = 6;
+const int PIN_CS   = 7;
+const int PIN_RST  = 10;
+const int PIN_DIO0 = 3;
+
+// Configuracion de radio
+const long FRECUENCIA = 433E6;
+
+// Estadisticas acumuladas
+unsigned long paquetesRecibidos = 0;
+unsigned long bytesRecibidos = 0;
+
+// Estadisticas del ultimo intervalo de 1 segundo
+unsigned long paquetesIntervalo = 0;
+unsigned long bytesIntervalo = 0;
+
+unsigned long inicio = 0;
+unsigned long ultimoReporte = 0;
+unsigned long ultimoPaquete = 0;
+
+float rssiPromedio = 0;
+float snrPromedio = 0;
+
+bool hayPaquete = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("   ESTACION TERRENA - LoRa 433");
+  Serial.println("==================================");
+
+  // Inicializar SPI con los GPIO elegidos
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+
+  // Pines de control del modulo
+  LoRa.setPins(PIN_CS, PIN_RST, PIN_DIO0);
+
+  Serial.println("Inicializando modulo LoRa...");
+
+  if (!LoRa.begin(FRECUENCIA)) {
+    Serial.println("ERROR: no se pudo iniciar el LoRa.");
+    Serial.println("Revisar cableado y alimentacion.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Parametros iniciales de radio.
+  // El transmisor debera usar los mismos.
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
+
+  inicio = millis();
+  ultimoReporte = inicio;
+
+  Serial.println("LoRa inicializado correctamente.");
+  Serial.println("Frecuencia: 433 MHz");
+  Serial.println("SF: 7 | BW: 125 kHz | CR: 4/5");
+  Serial.println("Sync Word: 0x12 | CRC habilitado");
+  Serial.println("Esperando paquetes...");
+  Serial.println();
+}
+
+void loop() {
+  // Comprobar si llego un paquete
+  int tamano = LoRa.parsePacket();
+
+  if (tamano > 0) {
+    String trama = "";
+
+    while (LoRa.available()) {
+      trama += (char)LoRa.read();
+    }
+
+    int rssi = LoRa.packetRssi();
+    float snr = LoRa.packetSnr();
+
+    paquetesRecibidos++;
+    paquetesIntervalo++;
+
+    bytesRecibidos += tamano;
+    bytesIntervalo += tamano;
+
+    ultimoPaquete = millis();
+    hayPaquete = true;
+
+    // Promedios acumulados de RSSI y SNR
+    if (paquetesRecibidos == 1) {
+      rssiPromedio = rssi;
+      snrPromedio = snr;
+    } else {
+      rssiPromedio +=
+        (rssi - rssiPromedio) / paquetesRecibidos;
+
+      snrPromedio +=
+        (snr - snrPromedio) / paquetesRecibidos;
+    }
+
+    Serial.println("---------- PAQUETE RECIBIDO ----------");
+
+    Serial.print("Nro. recibido: ");
+    Serial.println(paquetesRecibidos);
+
+    Serial.print("Trama: ");
+    Serial.println(trama);
+
+    Serial.print("Tamano: ");
+    Serial.print(tamano);
+    Serial.println(" bytes");
+
+    Serial.print("RSSI: ");
+    Serial.print(rssi);
+    Serial.println(" dBm");
+
+    Serial.print("SNR: ");
+    Serial.print(snr, 1);
+    Serial.println(" dB");
+
+    Serial.print("Tiempo desde inicio: ");
+    Serial.print((millis() - inicio) / 1000.0, 2);
+    Serial.println(" s");
+
+    Serial.println("--------------------------------------");
+    Serial.println();
+  }
+
+  // Reporte de estadisticas cada segundo
+  unsigned long ahora = millis();
+
+  if (ahora - ultimoReporte >= 1000) {
+    float segundos =
+      (ahora - ultimoReporte) / 1000.0;
+
+    float paquetesPorSegundo =
+      paquetesIntervalo / segundos;
+
+    float bytesPorSegundo =
+      bytesIntervalo / segundos;
+
+    Serial.println("========== ESTADISTICAS ==========");
+
+    Serial.print("Paquetes recibidos: ");
+    Serial.println(paquetesRecibidos);
+
+    Serial.print("Bytes acumulados: ");
+    Serial.println(bytesRecibidos);
+
+    Serial.print("Tasa de recepcion: ");
+    Serial.print(paquetesPorSegundo, 2);
+    Serial.println(" paquetes/s");
+
+    Serial.print("Caudal util recibido: ");
+    Serial.print(bytesPorSegundo, 1);
+    Serial.println(" bytes/s");
+
+    Serial.print("RSSI promedio: ");
+    if (hayPaquete) {
+      Serial.print(rssiPromedio, 1);
+      Serial.println(" dBm");
+    } else {
+      Serial.println("Sin datos");
+    }
+
+    Serial.print("SNR promedio: ");
+    if (hayPaquete) {
+      Serial.print(snrPromedio, 1);
+      Serial.println(" dB");
+    } else {
+      Serial.println("Sin datos");
+    }
+
+    Serial.print("Ultimo paquete hace: ");
+    if (hayPaquete) {
+      Serial.print((ahora - ultimoPaquete) / 1000.0, 1);
+      Serial.println(" s");
+    } else {
+      Serial.println("Nunca");
+    }
+
+    Serial.print("Tiempo total: ");
+    Serial.print((ahora - inicio) / 1000.0, 1);
+    Serial.println(" s");
+
+    Serial.println("==================================");
+    Serial.println();
+
+    paquetesIntervalo = 0;
+    bytesIntervalo = 0;
+    ultimoReporte = ahora;
+  }
+}
