@@ -3,43 +3,37 @@
 
 #include <stdint.h>
 
-/**
- * @file lora_config.h
- * @brief ESP32-C3 Super Mini hardware pinout, power safety, and SX1278 RF parameters.
- *
- * Uses the native ESP32-C3 hardware FSPI (SPI2) pins (GPIOs 4..7) and safe
- * control GPIOs (3, 10), strictly avoiding internal SPI flash pins (GPIOs 12..17)
- * and strapping pins (GPIOs 2, 8, 9).
- */
+// ============================================================================
+//  REFERENCE HARDWARE PINOUT & LORA RF CONFIGURATION (ESP32-C3 SUPER MINI)
+// ============================================================================
+//  Note: Both Arduino sketches (.ino) also expose these constants directly in
+//  "SECTION 1: USER CONFIGURATION" so users can edit pins in one place without
+//  opening extra header files. This header stays synchronized for shared tests.
+// ============================================================================
 
-// ============================================================
-// ESP32-C3 SUPER MINI <-> XL1278-SMT / SX1278 WIRING
-// ============================================================
-constexpr int PIN_LORA_SCK  = 4;
-constexpr int PIN_LORA_MISO = 5;
-constexpr int PIN_LORA_MOSI = 6;
-constexpr int PIN_LORA_CS   = 7;
-constexpr int PIN_LORA_RST  = 10; // Set to -1 if RST is disconnected
-constexpr int PIN_LORA_DIO0 = 3;
+// --- ESP32-C3 Super Mini -> SX1278 / XL1278-SMT Wiring ---
+// Safe FSPI (SPI2) pins + control GPIOs; avoids internal flash GPIOs 12..17
+// and boot strapping pins 2, 8, 9.
+const int PIN_SCK  = 4;   // SPI Clock
+const int PIN_MISO = 5;   // SPI Master In Slave Out
+const int PIN_MOSI = 6;   // SPI Master Out Slave In
+const int PIN_CS   = 7;   // LoRa NSS / Chip Select
+const int PIN_RST  = 10;  // LoRa Reset (set to -1 if disconnected)
+const int PIN_DIO0 = 3;   // LoRa DIO0 (Packet Ready / TX Done Interrupt)
 
-// ============================================================
-// LORA RF LINK PARAMETERS (433 MHz, 10 Hz TELEMETRY PROFILE)
-// ============================================================
-// With SF7, BW = 250 kHz, CR = 4/5, and a 65-byte binary frame:
-//   Time on Air (ToA) = 61.57 ms (< 100 ms period, 47.5% duty cycle).
-constexpr long    LORA_FREQUENCY_HZ     = 433E6;
-constexpr long    LORA_BANDWIDTH_HZ     = 250E3;
-constexpr int     LORA_SPREADING_FACTOR = 7;
-constexpr int     LORA_CODING_RATE_4    = 5;
-constexpr uint8_t LORA_SYNC_WORD        = 0x12;
+// --- LoRa RF Link Parameters (433 MHz, 10 Hz Telemetry Profile) ---
+// With SF7, BW = 250 kHz, CR = 4/5, and a 65-byte frame:
+//   Time-on-Air (ToA) = 61.57 ms (< 100 ms interval).
+const long    LORA_FREQUENCY        = 433E6; // 433 MHz
+const long    LORA_BANDWIDTH        = 250E3; // 250 kHz
+const int     LORA_SPREADING_FACTOR = 7;     // SF7
+const int     LORA_CODING_RATE      = 5;     // CR 4/5
+const uint8_t LORA_SYNC_WORD        = 0x12;  // Private sync word
 
-// Safe 2 dBm default for USB/LDO bench testing to prevent 3.3V rail brownout resets.
-// For outdoor flight range, increase to 17 (or 20) ONLY after adding a 220-470 uF
-// bulk decoupling capacitor (or dedicated 3.3V LDO >= 500 mA) on the LoRa VCC rail.
-constexpr int LORA_TX_POWER_DBM = 2;
-
-// Nominal 10 Hz transmission cadence (100 ms interval)
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 100UL;
+// Safe 2 dBm default for USB bench testing to prevent 3.3V brownout resets.
+// Increase to 17..20 dBm ONLY with external 3.3V LDO (>=500 mA) + 470 uF capacitor.
+const int           LORA_TX_POWER  = 2;
+const unsigned long TX_INTERVAL_MS = 100;
 
 #if defined(ARDUINO)
 #include <Arduino.h>
@@ -51,55 +45,40 @@ constexpr uint32_t TELEMETRY_INTERVAL_MS = 100UL;
 #include "soc/rtc_cntl_reg.h"
 #endif
 
-/**
- * @brief Disables the internal ESP32 brownout detector for bench RF testing.
- *
- * Note: For flight hardware, resolve voltage sags electrically using bulk
- * capacitance and a dedicated 3.3V regulator rather than relying on BOD disable.
- */
 inline void disableBrownoutDetector() {
 #if defined(ESP_PLATFORM) && defined(RTC_CNTL_BROWN_OUT_REG)
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 #endif
 }
 
-/**
- * @brief Reads the SX1278 silicon version register (0x42, expected 0x12) via SPI.
- */
 inline uint8_t readSx1278VersionRegister() {
-    pinMode(PIN_LORA_CS, OUTPUT);
-    digitalWrite(PIN_LORA_CS, LOW);
-    SPI.transfer(0x42 & 0x7F);
-    uint8_t version = SPI.transfer(0x00);
-    digitalWrite(PIN_LORA_CS, HIGH);
-    return version;
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(0x42 & 0x7F);
+  uint8_t version = SPI.transfer(0x00);
+  digitalWrite(PIN_CS, HIGH);
+  return version;
 }
 
-/**
- * @brief Initializes FSPI and configures the XL1278-SMT / SX1278 radio.
- * @param isTransmitter True to configure TX power for transmitter role.
- * @return True if the SX1278 responded and configured cleanly.
- */
 inline bool initLoRaRadio(bool isTransmitter) {
-    // Pass -1 for SS so the LoRa library maintains manual GPIO control over PIN_LORA_CS
-    SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, -1);
-    LoRa.setPins(PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_DIO0);
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  LoRa.setPins(PIN_CS, PIN_RST, PIN_DIO0);
 
-    if (!LoRa.begin(LORA_FREQUENCY_HZ)) {
-        return false;
-    }
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+    return false;
+  }
 
-    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-    LoRa.setSignalBandwidth(LORA_BANDWIDTH_HZ);
-    LoRa.setCodingRate4(LORA_CODING_RATE_4);
-    LoRa.setSyncWord(LORA_SYNC_WORD);
-    LoRa.enableCrc();
+  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+  LoRa.setSignalBandwidth(LORA_BANDWIDTH);
+  LoRa.setCodingRate4(LORA_CODING_RATE);
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  LoRa.enableCrc();
 
-    if (isTransmitter) {
-        LoRa.setTxPower(LORA_TX_POWER_DBM);
-    }
+  if (isTransmitter) {
+    LoRa.setTxPower(LORA_TX_POWER);
+  }
 
-    return true;
+  return true;
 }
 #endif // ARDUINO
 
