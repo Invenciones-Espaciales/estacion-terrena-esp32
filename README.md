@@ -6,22 +6,30 @@ Firmware for the **Experimental Rocket V2** Communications & Telemetry subsystem
 
 ## Code Structure (Designed for Quick Editing)
 
-Both Arduino sketches are intentionally **self-contained** and organized into **6 numbered sections** so anyone on the team can read a sketch top-to-bottom and modify pins or parameters in seconds:
+All Arduino sketches are intentionally **self-contained** and organized into **6 numbered sections** so anyone on the team can read a sketch top-to-bottom and modify pins or parameters in seconds:
 
-1. **SECTION 1: USER CONFIGURATION (PINS, RADIO & TIMING)** — All pin assignments, LoRa frequency/bandwidth/SF/CR/TX power, serial baud rate, intervals, and debug/binary modes in one place at the very top.
+1. **SECTION 1: USER CONFIGURATION (PINS, RADIO & TIMING)** — All pin assignments, LoRa frequency/bandwidth/SF/CR/TX power, serial baud rate, FreeRTOS rates/priorities, and debug/binary modes in one place at the very top.
 2. **SECTION 2: 65-BYTE TELEMETRY PACKET STRUCTURE (`LoRaPacket`)** — Exact packed struct matching `config/frame.yaml`.
-3. **SECTION 3: GLOBAL VARIABLES** — Link statistics and runtime state.
+3. **SECTION 3: GLOBAL VARIABLES / FREERTOS HANDLES** — Link statistics, mutex/queue handles, and runtime state.
 4. **SECTION 4: HELPER FUNCTIONS** — `calculateCRC16`, `getStatusName`, formatting/printing, and packet builder.
-5. **SECTION 5: `setup()`** — Initializes Serial, `SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS)`, and `LoRa.setPins(PIN_CS, PIN_RST, PIN_DIO0)`.
-6. **SECTION 6: `loop()`** — Runs the 10 Hz TX simulation loop or RX packet listener.
+5. **SECTION 5: `setup()` / FREERTOS TASKS** — Hardware initialization (`SPI.begin(...)`, `LoRa.setPins(...)`) and FreeRTOS task definitions (`TransmisorCoheteRTOS`).
+6. **SECTION 6: `loop()` / `setup() & loop()`** — Main loop or RTOS scheduler startup.
 
 ### Files in This Repository
 
-- `TransmisorCohete/TransmisorCohete.ino` — Rocket TX sketch (10 Hz RF transmission + 1 Hz Serial status summary).
+- `TransmisorCohete/TransmisorCohete.ino` — Simple single-loop Rocket TX sketch (10 Hz RF transmission + 1 Hz Serial summary).
 - `TransmisorCohete/flight_simulator.h` — 290-second simulated rocket flight curves (`fillSimulatedSensorData`) for bench testing.
+- `TransmisorCoheteRTOS/TransmisorCoheteRTOS.ino` — **FreeRTOS Rocket TX** sketch separating 50 Hz sensor acquisition (`TaskSensors`), 10 Hz LoRa RF transmission (`TaskLoRaTx`), and non-blocking Serial logging (`TaskSerialLogger`) via a mutex and queue.
+- `TransmisorCoheteRTOS/flight_simulator.h` — Companion simulator header for `TransmisorCoheteRTOS`.
 - `EscuchaTramaEstacionTerrena/EscuchaTramaEstacionTerrena.ino` — Ground Station RX sketch (Human-Readable Serial Monitor cards by default; live toggle to raw 65-byte Binary mode).
 - `include/lora_config.h` & `include/telemetry_protocol.h` — Synchronized reference headers used by host verification tests.
 - `tests/verify_protocol.cpp` — Host C++ test validating 65-byte layout, offsets, CRC-16/CCITT-FALSE, and simulation timing.
+
+### FreeRTOS Rocket Transmitter Architecture (`TransmisorCoheteRTOS`)
+
+- **`TaskSensors` (50 Hz / `20 ms`, Priority `3`):** Runs on deterministic `vTaskDelayUntil`, samples flight/sensor telemetry every 20 ms, and publishes the latest snapshot under `sensorMutex`.
+- **`TaskLoRaTx` (10 Hz / `100 ms`, Priority `2`):** Reads the latest snapshot via `sensorMutex`, attaches `sync = 0xAA` and `frame_number`, computes `CRC-16/CCITT-FALSE`, transmits the 65-byte frame over SX1278 LoRa, and pushes a `TxLogEvent` to `txLogQueue`.
+- **`TaskSerialLogger` (Event-driven, Priority `1`):** Blocks on `txLogQueue` (`portMAX_DELAY`) with zero polling overhead and handles USB Serial printing without delaying RF packets or sensor sampling.
 
 ---
 
