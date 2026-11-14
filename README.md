@@ -19,17 +19,21 @@ All Arduino sketches are intentionally **self-contained** and organized into **6
 
 - `TransmisorCohete/TransmisorCohete.ino` — Simple single-loop Rocket TX sketch (10 Hz RF transmission + 1 Hz Serial summary).
 - `TransmisorCohete/flight_simulator.h` — 290-second simulated rocket flight curves (`fillSimulatedSensorData`) for bench testing.
-- `TransmisorCoheteRTOS/TransmisorCoheteRTOS.ino` — **FreeRTOS Rocket TX** sketch separating 50 Hz sensor acquisition (`TaskSensors`), 10 Hz LoRa RF transmission (`TaskLoRaTx`), and non-blocking Serial logging (`TaskSerialLogger`) via a mutex and queue.
+- `TransmisorCoheteRTOS/TransmisorCoheteRTOS.ino` — **FreeRTOS OBC (Avionics + COMMS)** sketch exposing `updateRocketTelemetry(const LoRaPacket&)` as a single non-blocking API between the Avionics task (`TaskAvionics`) and the COMMS LoRa tasks (`TaskLoRaTx` + `TaskSerialLogger`).
 - `TransmisorCoheteRTOS/flight_simulator.h` — Companion simulator header for `TransmisorCoheteRTOS`.
 - `EscuchaTramaEstacionTerrena/EscuchaTramaEstacionTerrena.ino` — Ground Station RX sketch (Human-Readable Serial Monitor cards by default; live toggle to raw 65-byte Binary mode).
 - `include/lora_config.h` & `include/telemetry_protocol.h` — Synchronized reference headers used by host verification tests.
 - `tests/verify_protocol.cpp` — Host C++ test validating 65-byte layout, offsets, CRC-16/CCITT-FALSE, and simulation timing.
 
-### FreeRTOS Rocket Transmitter Architecture (`TransmisorCoheteRTOS`)
+### FreeRTOS Rocket Architecture (`TransmisorCoheteRTOS` — Avionics + COMMS)
 
-- **`TaskSensors` (50 Hz / `20 ms`, Priority `3`):** Runs on deterministic `vTaskDelayUntil`, samples flight/sensor telemetry every 20 ms, and publishes the latest snapshot under `sensorMutex`.
-- **`TaskLoRaTx` (10 Hz / `100 ms`, Priority `2`):** Reads the latest snapshot via `sensorMutex`, attaches `sync = 0xAA` and `frame_number`, computes `CRC-16/CCITT-FALSE`, transmits the 65-byte frame over SX1278 LoRa, and pushes a `TxLogEvent` to `txLogQueue`.
-- **`TaskSerialLogger` (Event-driven, Priority `1`):** Blocks on `txLogQueue` (`portMAX_DELAY`) with zero polling overhead and handles USB Serial printing without delaying RF packets or sensor sampling.
+Designed as a **Producer-Consumer Mailbox** so the Avionics team never waits on slow `~61.6 ms` LoRa transmissions or USB Serial prints:
+
+- **Single Avionics Entry Point (`updateRocketTelemetry(const LoRaPacket&)`):** Populate your `LoRaPacket` with the 18 sensor/flight fields (`timestamp`, `status`, barometer, IMU, GPS, pyro pins) and pass the struct here (~2 microseconds under `sensorMutex`). `sync`, `frame_number`, and `crc` are computed automatically by COMMS.
+- **Single COMMS Initializer (`initCommsLoRa()`):** Initializes SPI/SX1278 pins, creates `sensorMutex` and `txLogQueue`, and launches the background COMMS tasks.
+- **`TaskAvionics` (50 Hz / `20 ms`, Priority `3`):** Runs on deterministic `vTaskDelayUntil`, reads sensors/FSM, and calls `updateRocketTelemetry(avionicsData)`.
+- **`TaskLoRaTx` (10 Hz / `100 ms`, Priority `2`):** Reads the newest struct from the `sensorMutex` mailbox, stamps `sync = 0xAA` and `frame_number`, calculates `CRC-16/CCITT-FALSE`, transmits the 65-byte frame over SX1278 LoRa, and posts a `TxLogEvent` to `txLogQueue`.
+- **`TaskSerialLogger` (Event-driven, Priority `1`):** Sleeps on `txLogQueue` (`portMAX_DELAY`) and prints 1 Hz status / phase-change logs over USB Serial.
 
 ---
 
