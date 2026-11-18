@@ -7,19 +7,20 @@
 #endif
 
 // ============================================================================
-//  GROUND STATION RECEIVER (LoRa 433 MHz -> Serial Monitor / PC Bridge)
+//  GROUND STATION RECEIVER (LoRa 433 MHz -> 'H' Debug / 97B 'B' PC Bridge)
 //  Board : ESP32-C3 Super Mini + XL1278-SMT / SX1278 (433 MHz)
 //
-//  Quick Usage:
-//    - Edit pins, radio settings, or output mode in SECTION 1 below.
-//    - Open Arduino Serial Monitor at 115200 baud to view telemetry cards.
-//    - Send 'B' in Serial Monitor to switch to raw 65-byte Binary mode
-//      (for estacion-terrena-pc/main.py), or 'H' to return to Human-Readable.
+//  Output Modes (Live Mode Router):
+//    - 'H' (Default at boot) : Human-Readable telemetry cards + 1 Hz stats.
+//    - 'B' (PC Dashboard)    : 97-byte Binary USB frames (32B GS Header + 65B
+//                              Rocket Frame). Requires 'B' keepalive every
+//                              2 s; auto-reverts to 'H' after 6 s if PC dies.
+//    - 'M' (Manual Binary)   : Sticky 97-byte Binary mode (no timeout) until 'H'.
 // ============================================================================
 
 
 // ============================================================================
-//  SECTION 1: USER CONFIGURATION (PINS, RADIO & TIMING)
+//  SECTION 1: USER CONFIGURATION (PINS, RADIO, WATCHDOG & DISPLAY)
 // ============================================================================
 
 // --- ESP32-C3 Super Mini -> SX1278 / XL1278-SMT Wiring ---
@@ -31,34 +32,51 @@ const int PIN_CS   = 7;   // LoRa NSS / Chip Select
 const int PIN_RST  = 10;  // LoRa Reset (set to -1 if RST is disconnected)
 const int PIN_DIO0 = 3;   // LoRa DIO0 (Packet Ready Signal)
 
-// --- LoRa Radio Parameters (Must match Transmitter!) ---
+// --- LoRa Radio Parameters (Must match Rocket Transmitter!) ---
 const long    LORA_FREQUENCY        = 433E6; // 433 MHz carrier frequency
-const long    LORA_BANDWIDTH        = 250E3; // 250 kHz bandwidth (required for 10 Hz link budget)
+const long    LORA_BANDWIDTH        = 250E3; // 250 kHz bandwidth (10 Hz link budget)
 const int     LORA_SPREADING_FACTOR = 7;     // SF7 (fastest chirp rate, ~61.6 ms Time-on-Air)
 const int     LORA_CODING_RATE      = 5;     // CR 4/5 error coding denominator
 const uint8_t LORA_SYNC_WORD        = 0x12;  // Private network sync word
 
-// --- Serial, Mode & Display Settings ---
+// --- Serial, Mode Router & Timing Settings ---
 const long          SERIAL_BAUD            = 115200;
-const bool          HUMAN_READABLE_MODE    = true;   // true = readable cards, false = raw 65B frames for main.py
-const unsigned long PACKET_PRINT_MS        = 500;    // Print detailed card every 500 ms (0 = print every packet)
-const unsigned long STATS_INTERVAL_MS      = 1000;   // Print link statistics every 1000 ms
-const unsigned long LINK_TIMEOUT_MS        = 2000;   // Mark link INACTIVE after 2000 ms without valid packet
+const bool          HUMAN_READABLE_DEFAULT = true;   // Always start in 'H' mode on boot
+const unsigned long PACKET_PRINT_MS        = 500;    // Detailed card cadence in 'H' mode (0 = every packet)
+const unsigned long STATS_INTERVAL_MS      = 1000;   // Link stats print cadence in 'H' mode
+const unsigned long LINK_TIMEOUT_MS        = 2000;   // Link marked inactive after 2.0 s of RF silence
+const unsigned long BINARY_WATCHDOG_MS     = 6000;   // Auto-revert 'B' -> 'H' after 6.0 s without keepalive
 const bool          DISABLE_BROWNOUT_CHECK = true;   // Prevents false ESP32-C3 USB brownout resets
 
-// --- Protocol Constants (Must match config/frame.yaml in estacion-terrena-pc) ---
-const uint8_t SYNC_BYTE   = 0xAA;
-const size_t  PACKET_SIZE = 65;
+// --- Protocol Constants ---
+const uint8_t GS_SYNC_BYTE       = 0xAB; // Ground Station USB header sync byte
+const uint8_t GS_PROTO_VERSION   = 0x10; // Upper nibble = protocol v1
+const uint8_t ROCKET_SYNC_BYTE   = 0xAA; // Rocket RF frame sync byte (config/frame.yaml)
+const size_t  ROCKET_PACKET_SIZE = 65;   // Fixed 65-byte over-the-air LoRa frame
 
 
 // ============================================================================
-//  SECTION 2: 65-BYTE TELEMETRY PACKET STRUCTURE (LoRaPacket)
+//  SECTION 2: BINARY TELEMETRY STRUCTURES (32B GS HEADER + 65B ROCKET = 97B)
 // ============================================================================
-//  Little-Endian packed struct matching estacion-terrena-pc/config/frame.yaml:
-//    Header  [0..6]   : 7 bytes  (sync, frame_number, timestamp)
-//    Payload [7..62]  : 56 bytes (status, barometer, IMU, GPS, pyro flags)
-//    Trailer [63..64] : 2 bytes  (CRC-16/CCITT-FALSE over bytes 0..62)
+//  Over the air (RF), only the 65-byte `LoRaPacket` is transmitted.
+//  Over USB Serial in Binary mode, the Ground Station prepends a fixed
+//  32-byte `GroundStationHeader` containing RSSI, SNR, and RX link counters.
 // ============================================================================
+
+struct __attribute__((packed)) GroundStationHeader {
+  uint8_t  gs_sync;        // [0]      Fixed GS header sync byte (0xAB)
+  uint8_t  gs_flags;       // [1]      Bits 7..4 = proto v1 (0x10);
+                           //          bit0=rocket_crc_ok, bit1=link_active, bit2=tx_reboot
+  int16_t  rssi;           // [2..3]   LoRa packet RSSI (dBm)
+  float    snr;            // [4..7]   LoRa packet SNR (dB)
+  uint32_t gs_uptime_ms;   // [8..11]  Ground Station uptime millis()
+  uint32_t rx_packets;     // [12..15] Valid 65B rocket packets received
+  uint32_t rx_lost;        // [16..19] Estimated lost packets (sequence gaps)
+  uint32_t rx_crc_errors;  // [20..23] Software CRC-16 failure counter
+  uint32_t rx_size_errors; // [24..27] Unexpected packet length / sync error counter
+  uint16_t tx_reboots;     // [28..29] Detected Rocket TX resets / 290s cycle wraps
+  uint16_t gs_crc;         // [30..31] CRC-16/CCITT-FALSE over GS header bytes 0..29
+};
 
 struct __attribute__((packed)) LoRaPacket {
   // Header (7 bytes)
@@ -89,21 +107,35 @@ struct __attribute__((packed)) LoRaPacket {
   uint16_t crc;            // [63..64] CRC-16/CCITT-FALSE over bytes 0..62
 };
 
-static_assert(sizeof(LoRaPacket) == 65, "LoRaPacket size must be exactly 65 bytes!");
+struct __attribute__((packed)) UsbTelemetryPacket {
+  GroundStationHeader gs;     // [0..31]  32 bytes GS metadata + GS CRC
+  LoRaPacket          rocket; // [32..96] 65 bytes untouched Rocket RF frame
+};
+
+static_assert(sizeof(GroundStationHeader) == 32, "GroundStationHeader must be 32 bytes!");
+static_assert(sizeof(LoRaPacket) == 65,          "LoRaPacket must be 65 bytes!");
+static_assert(sizeof(UsbTelemetryPacket) == 97,  "UsbTelemetryPacket must be 97 bytes!");
+
+enum RxOutputMode {
+  MODE_HUMAN_READABLE  = 0,
+  MODE_BINARY_WATCHDOG = 1,
+  MODE_BINARY_STICKY   = 2
+};
 
 
 // ============================================================================
-//  SECTION 3: GLOBAL VARIABLES & LINK STATISTICS
+//  SECTION 3: GLOBAL VARIABLES & LINK COUNTERS
 // ============================================================================
 
-bool humanReadableMode = HUMAN_READABLE_MODE;
+RxOutputMode  rxMode                = HUMAN_READABLE_DEFAULT ? MODE_HUMAN_READABLE : MODE_BINARY_WATCHDOG;
+unsigned long lastBinaryKeepaliveMs = 0;
 
-// Link counters
-unsigned long packetsReceived = 0;
-unsigned long packetsLost     = 0;
-unsigned long crcErrors       = 0;
-unsigned long sizeErrors      = 0;
-unsigned long txReboots       = 0;
+// Persistent link integrity & diagnostics (active in BOTH 'H' and 'B' modes)
+uint32_t packetsReceived = 0;
+uint32_t packetsLost     = 0;
+uint32_t crcErrors       = 0;
+uint32_t sizeErrors      = 0;
+uint16_t txReboots       = 0;
 
 // Sequence & reboot tracking
 uint16_t lastFrameNumber   = 0;
@@ -120,7 +152,7 @@ long          rssiSampleCount   = 0;
 
 
 // ============================================================================
-//  SECTION 4: HELPER FUNCTIONS (CRC-16, STATUS LABELS & SERIAL PRINTING)
+//  SECTION 4: HELPER FUNCTIONS (CRC-16, STATUS LABELS & LIVE MODE ROUTER)
 // ============================================================================
 
 // Calculates CRC-16/CCITT-FALSE (Poly 0x1021, Init 0xFFFF, No Ref, XorOut 0x0000)
@@ -166,23 +198,118 @@ uint8_t readChipVersion() {
   return version;
 }
 
-// Switches dynamically between Human-Readable ('H') and Binary ('B') over Serial
-void checkSerialCommands() {
+// Handles live 'B' (dashboard watchdog binary), 'M' (manual sticky binary),
+// 'H' (human-readable), and auto-fallback when dashboard keepalives stop.
+void updateModeRouter(unsigned long now) {
   while (Serial.available() > 0) {
     int cmd = Serial.read();
+
     if (cmd == 'b' || cmd == 'B') {
-      if (humanReadableMode) {
-        Serial.println("\n[MODE] Switching to RAW BINARY mode (65B frames for main.py)...");
+      lastBinaryKeepaliveMs = now;
+      if (rxMode == MODE_HUMAN_READABLE) {
+        Serial.println("\n[MODE] Switching to BINARY mode (97B GS+Rocket frames)...");
         Serial.flush();
-        humanReadableMode = false;
+        rxMode = MODE_BINARY_WATCHDOG;
+      } else if (rxMode == MODE_BINARY_STICKY) {
+        rxMode = MODE_BINARY_WATCHDOG;
       }
+    } else if (cmd == 'm' || cmd == 'M') {
+      if (rxMode == MODE_HUMAN_READABLE) {
+        Serial.println("\n[MODE] Switching to STICKY BINARY mode (no timeout, send 'H' to exit)...");
+        Serial.flush();
+      }
+      rxMode = MODE_BINARY_STICKY;
     } else if (cmd == 'h' || cmd == 'H') {
-      if (!humanReadableMode) {
-        humanReadableMode = true;
+      if (rxMode != MODE_HUMAN_READABLE) {
+        rxMode          = MODE_HUMAN_READABLE;
+        lastStatsTimeMs = now;
         Serial.println("\n[MODE] Switched to HUMAN-READABLE debug mode.");
       }
     }
   }
+
+  // Watchdog fallback: if dashboard crashes or USB disconnects without sending 'H'
+  if (rxMode == MODE_BINARY_WATCHDOG && BINARY_WATCHDOG_MS > 0) {
+    if (now - lastBinaryKeepaliveMs >= BINARY_WATCHDOG_MS) {
+      rxMode          = MODE_HUMAN_READABLE;
+      lastStatsTimeMs = now;
+      Serial.println("\n[MODE] Dashboard keepalive timeout (6.0 s). Reverted to HUMAN-READABLE mode.");
+    }
+  }
+}
+
+
+// ============================================================================
+//  SECTION 5: PACKET PROCESSING, BINARY BUILDER & HUMAN-READABLE FORMATTERS
+// ============================================================================
+
+// Tracks sequence gaps & TX reboots/290s cycle wraps in BOTH 'H' and 'B' modes.
+// Returns true if this packet marks a TX reboot or cycle restart.
+bool updateSequenceStats(const LoRaPacket& pkt, unsigned long now) {
+  bool txRebootEvent = false;
+
+  if (hasFirstPacket) {
+    bool timeReset  = (pkt.timestamp < lastTimestampMs);
+    bool frameReset = (lastFrameNumber > 20 && pkt.frame_number < 10);
+
+    if (timeReset && frameReset) {
+      txReboots++;
+      txRebootEvent = true;
+      if (rxMode == MODE_HUMAN_READABLE) {
+        Serial.println("[INFO] Transmitter reboot or 290s cycle restart detected.");
+      }
+    } else {
+      uint16_t delta = (uint16_t)(pkt.frame_number - lastFrameNumber);
+      if (delta > 1 && delta < 32768) {
+        uint32_t gap = (uint32_t)(delta - 1);
+        packetsLost += gap;
+        if (rxMode == MODE_HUMAN_READABLE) {
+          Serial.print("[WARN] Packet loss detected: ");
+          Serial.print(gap);
+          Serial.println(" frame(s) missed.");
+        }
+      }
+    }
+  }
+
+  lastFrameNumber  = pkt.frame_number;
+  lastTimestampMs  = pkt.timestamp;
+  lastPacketTimeMs = now;
+  hasFirstPacket   = true;
+  return txRebootEvent;
+}
+
+// Builds the 97-byte USB frame (32B GS metadata + 65B untouched Rocket frame)
+UsbTelemetryPacket buildUsbTelemetryPacket(
+    const LoRaPacket& rocketPkt,
+    int               rssi,
+    float             snr,
+    bool              rocketCrcOk,
+    bool              txRebootEvent,
+    unsigned long     now
+) {
+  UsbTelemetryPacket out = {};
+
+  bool linkActive = hasFirstPacket && ((now - lastPacketTimeMs) < LINK_TIMEOUT_MS);
+  uint8_t flags   = GS_PROTO_VERSION;
+  if (rocketCrcOk)   flags |= 0x01;
+  if (linkActive)    flags |= 0x02;
+  if (txRebootEvent) flags |= 0x04;
+
+  out.gs.gs_sync        = GS_SYNC_BYTE;
+  out.gs.gs_flags       = flags;
+  out.gs.rssi           = (int16_t)rssi;
+  out.gs.snr            = snr;
+  out.gs.gs_uptime_ms   = (uint32_t)now;
+  out.gs.rx_packets     = packetsReceived;
+  out.gs.rx_lost        = packetsLost;
+  out.gs.rx_crc_errors  = crcErrors;
+  out.gs.rx_size_errors = sizeErrors;
+  out.gs.tx_reboots     = txReboots;
+  out.gs.gs_crc         = calculateCRC16((const uint8_t*)&out.gs, sizeof(GroundStationHeader) - 2);
+
+  out.rocket = rocketPkt;
+  return out;
 }
 
 // Prints a single decoded telemetry packet in a clean, readable block
@@ -251,14 +378,14 @@ void printLinkStatistics() {
   Serial.print("TX Reboots    : "); Serial.println(txReboots);
   Serial.print("PDR           : "); Serial.print(pdr, 2); Serial.println(" %");
   Serial.print("Average RSSI  : "); Serial.print(avgRssi, 1); Serial.println(" dBm");
-  Serial.println("Tip: Send 'B' for binary mode (main.py), 'H' for human-readable");
+  Serial.println("Commands: 'B'=Binary (97B w/ 6s watchdog), 'M'=Sticky Binary, 'H'=Human");
   Serial.println("================================");
   Serial.println();
 }
 
 
 // ============================================================================
-//  SECTION 5: SETUP
+//  SECTION 6: SETUP
 // ============================================================================
 
 void setup() {
@@ -274,7 +401,7 @@ void setup() {
   }
   delay(300);
 
-  if (humanReadableMode) {
+  if (rxMode == MODE_HUMAN_READABLE) {
     Serial.println();
     Serial.println("====================================================");
     Serial.println("   GROUND STATION RECEIVER - LoRa 433 MHz (ESP32-C3)");
@@ -286,7 +413,7 @@ void setup() {
   LoRa.setPins(PIN_CS, PIN_RST, PIN_DIO0);
 
   if (!LoRa.begin(LORA_FREQUENCY)) {
-    if (humanReadableMode) {
+    if (rxMode == MODE_HUMAN_READABLE) {
       Serial.print("ERROR: Failed to initialize SX1278/XL1278! Reg 0x42 = 0x");
       Serial.println(readChipVersion(), HEX);
       Serial.println("Check wiring in SECTION 1 (SCK, MISO, MOSI, CS, RST, DIO0, 3.3V).");
@@ -303,125 +430,100 @@ void setup() {
   LoRa.setSyncWord(LORA_SYNC_WORD);
   LoRa.enableCrc();
 
-  lastStatsTimeMs = millis();
+  unsigned long now     = millis();
+  lastStatsTimeMs       = now;
+  lastBinaryKeepaliveMs = now;
 
-  if (humanReadableMode) {
+  if (rxMode == MODE_HUMAN_READABLE) {
     Serial.println("LoRa initialized successfully.");
     Serial.println("Radio: 433 MHz | BW 250 kHz | SF 7 | CR 4/5 | Sync 0x12");
-    Serial.println("Listening for 65-byte LoRaPacket frames...");
-    Serial.println("Send 'B' over Serial for raw binary output (estacion-terrena-pc/main.py).");
+    Serial.println("Mode : HUMAN-READABLE ('H'). Send 'B' for 97B PC Binary mode.");
     Serial.println();
   }
 }
 
 
 // ============================================================================
-//  SECTION 6: MAIN LOOP
+//  SECTION 7: MAIN LOOP
 // ============================================================================
 
 void loop() {
-  checkSerialCommands();
+  unsigned long now = millis();
+  updateModeRouter(now);
 
   int packetSize = LoRa.parsePacket();
-  unsigned long now = millis();
 
   if (packetSize > 0) {
-    // 1. Verify expected 65-byte frame length
-    if (packetSize != (int)PACKET_SIZE) {
+    // 1. Validate 65-byte RF air packet length
+    if (packetSize != (int)ROCKET_PACKET_SIZE) {
       sizeErrors++;
       while (LoRa.available()) {
         LoRa.read();
       }
-      if (humanReadableMode) {
+      if (rxMode == MODE_HUMAN_READABLE) {
         Serial.print("[WARN] Unexpected packet size: ");
         Serial.print(packetSize);
         Serial.print(" bytes (expected ");
-        Serial.print(PACKET_SIZE);
+        Serial.print(ROCKET_PACKET_SIZE);
         Serial.println(")");
       }
-      return;
-    }
+    } else {
+      // 2. Read raw 65 bytes straight into LoRaPacket
+      LoRaPacket rxPacket = {};
+      size_t bytesRead = LoRa.readBytes((uint8_t*)&rxPacket, ROCKET_PACKET_SIZE);
 
-    // 2. Read raw bytes straight into our 65-byte LoRaPacket struct
-    LoRaPacket rxPacket;
-    size_t bytesRead = LoRa.readBytes((uint8_t*)&rxPacket, PACKET_SIZE);
-    if (bytesRead != PACKET_SIZE) {
-      sizeErrors++;
-      return;
-    }
-
-    // 3. Check 0xAA sync header byte
-    if (rxPacket.sync != SYNC_BYTE) {
-      sizeErrors++;
-      if (humanReadableMode) {
-        Serial.print("[WARN] Invalid sync byte: 0x");
-        Serial.println(rxPacket.sync, HEX);
-      }
-      return;
-    }
-
-    // 4. In RAW BINARY mode, forward valid frames directly to PC software (main.py)
-    if (!humanReadableMode) {
-      Serial.write((const uint8_t*)&rxPacket, PACKET_SIZE);
-      packetsReceived++;
-      lastPacketTimeMs = now;
-      hasFirstPacket   = true;
-      return;
-    }
-
-    // 5. Verify CRC-16/CCITT-FALSE over bytes 0..62
-    uint16_t expectedCrc = calculateCRC16((const uint8_t*)&rxPacket, PACKET_SIZE - 2);
-    bool crcOk = (expectedCrc == rxPacket.crc);
-
-    int rssi  = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
-
-    if (!crcOk) {
-      crcErrors++;
-      printPacketHumanReadable(rxPacket, rssi, snr, false);
-      return;
-    }
-
-    // 6. Track packet sequence gaps and transmitter reboots/cycles
-    if (hasFirstPacket) {
-      bool timeReset  = (rxPacket.timestamp < lastTimestampMs);
-      bool frameReset = (lastFrameNumber > 20 && rxPacket.frame_number < 10);
-
-      if (timeReset && frameReset) {
-        txReboots++;
-        Serial.println("[INFO] Transmitter reboot or 290s cycle restart detected.");
+      if (bytesRead != ROCKET_PACKET_SIZE || rxPacket.sync != ROCKET_SYNC_BYTE) {
+        sizeErrors++;
+        if (rxMode == MODE_HUMAN_READABLE) {
+          Serial.print("[WARN] Invalid sync/read | len=");
+          Serial.print(bytesRead);
+          Serial.print(" sync=0x");
+          Serial.println(rxPacket.sync, HEX);
+        }
       } else {
-        uint16_t delta = (uint16_t)(rxPacket.frame_number - lastFrameNumber);
-        if (delta > 1 && delta < 32768) {
-          unsigned long gap = (unsigned long)(delta - 1);
-          packetsLost += gap;
-          Serial.print("[WARN] Packet loss detected: ");
-          Serial.print(gap);
-          Serial.println(" frame(s) missed.");
+        // 3. Verify Rocket CRC-16/CCITT-FALSE & read RF metrics
+        uint16_t expectedCrc = calculateCRC16((const uint8_t*)&rxPacket, ROCKET_PACKET_SIZE - 2);
+        bool crcOk           = (expectedCrc == rxPacket.crc);
+        int rssi             = LoRa.packetRssi();
+        float snr            = LoRa.packetSnr();
+        bool txRebootEvent   = false;
+
+        if (crcOk) {
+          packetsReceived++;
+          accumRssi += rssi;
+          rssiSampleCount++;
+          txRebootEvent = updateSequenceStats(rxPacket, now);
+        } else {
+          crcErrors++;
+        }
+
+        // 4. Emit 97B GS+Rocket frame in Binary mode OR cards in Human-Readable mode
+        if (rxMode != MODE_HUMAN_READABLE) {
+          UsbTelemetryPacket usbPacket = buildUsbTelemetryPacket(
+            rxPacket,
+            rssi,
+            snr,
+            crcOk,
+            txRebootEvent,
+            now
+          );
+          Serial.write((const uint8_t*)&usbPacket, sizeof(UsbTelemetryPacket));
+        } else {
+          bool phaseChanged = crcOk && (rxPacket.status != lastPrintedStatus);
+          if (!crcOk || PACKET_PRINT_MS == 0 || phaseChanged || (now - lastPacketPrintMs >= PACKET_PRINT_MS)) {
+            lastPacketPrintMs = now;
+            if (crcOk) {
+              lastPrintedStatus = rxPacket.status;
+            }
+            printPacketHumanReadable(rxPacket, rssi, snr, crcOk);
+          }
         }
       }
     }
-
-    lastFrameNumber  = rxPacket.frame_number;
-    lastTimestampMs  = rxPacket.timestamp;
-    lastPacketTimeMs = now;
-    hasFirstPacket   = true;
-
-    packetsReceived++;
-    accumRssi += rssi;
-    rssiSampleCount++;
-
-    // 7. Print decoded telemetry card (throttled by PACKET_PRINT_MS, immediate on phase change)
-    bool phaseChanged = (rxPacket.status != lastPrintedStatus);
-    if (PACKET_PRINT_MS == 0 || phaseChanged || (now - lastPacketPrintMs >= PACKET_PRINT_MS)) {
-      lastPacketPrintMs = now;
-      lastPrintedStatus = rxPacket.status;
-      printPacketHumanReadable(rxPacket, rssi, snr, true);
-    }
   }
 
-  // Print periodic 1 Hz statistics in Human-Readable mode
-  if (humanReadableMode && (now - lastStatsTimeMs >= STATS_INTERVAL_MS)) {
+  // 5. Print periodic 1 Hz statistics in Human-Readable mode
+  if (rxMode == MODE_HUMAN_READABLE && (now - lastStatsTimeMs >= STATS_INTERVAL_MS)) {
     lastStatsTimeMs = now;
     printLinkStatistics();
   }

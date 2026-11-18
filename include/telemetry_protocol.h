@@ -17,6 +17,11 @@ const uint8_t SYNC_BYTE        = 0xAA;
 const size_t  PACKET_SIZE      = 65;
 const size_t  CRC_PAYLOAD_SIZE = 63;
 
+const uint8_t GS_SYNC_BYTE        = 0xAB;
+const uint8_t GS_PROTO_VERSION    = 0x10;
+const size_t  GS_HEADER_SIZE      = 32;
+const size_t  USB_PACKET_SIZE     = 97;
+
 enum FlightStatus : uint8_t {
   STATUS_STANDBY     = 0x00,
   STATUS_POWERED     = 0x01,
@@ -62,6 +67,28 @@ struct __attribute__((packed)) LoRaPacket {
 #endif // LORA_PACKET_DEFINED
 
 static_assert(sizeof(LoRaPacket) == 65, "LoRaPacket must be exactly 65 bytes");
+
+struct __attribute__((packed)) GroundStationHeader {
+  uint8_t  gs_sync;        // [0]      0xAB
+  uint8_t  gs_flags;       // [1]      Bits 7..4 = proto v1; bit0=crc_ok, bit1=link_active, bit2=tx_reboot
+  int16_t  rssi;           // [2..3]   RSSI (dBm)
+  float    snr;            // [4..7]   SNR (dB)
+  uint32_t gs_uptime_ms;   // [8..11]  GS millis()
+  uint32_t rx_packets;     // [12..15] Valid packets RX
+  uint32_t rx_lost;        // [16..19] Sequence loss count
+  uint32_t rx_crc_errors;  // [20..23] CRC error count
+  uint32_t rx_size_errors; // [24..27] Size/sync error count
+  uint16_t tx_reboots;     // [28..29] TX reboot/cycle count
+  uint16_t gs_crc;         // [30..31] CRC-16/CCITT-FALSE over bytes 0..29
+};
+
+struct __attribute__((packed)) UsbTelemetryPacket {
+  GroundStationHeader gs;     // [0..31]
+  LoRaPacket          rocket; // [32..96]
+};
+
+static_assert(sizeof(GroundStationHeader) == 32, "GroundStationHeader must be 32 bytes");
+static_assert(sizeof(UsbTelemetryPacket) == 97, "UsbTelemetryPacket must be 97 bytes");
 
 // Computes CRC-16/CCITT-FALSE (Poly 0x1021, Init 0xFFFF, RefIn=false, RefOut=false, XorOut=0x0000)
 inline uint16_t calculateCRC16(const uint8_t* data, size_t length) {

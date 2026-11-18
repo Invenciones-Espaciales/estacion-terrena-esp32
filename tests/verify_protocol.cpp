@@ -34,6 +34,22 @@ int main(int argc, char** argv) {
   static_assert(offsetof(LoRaPacket, pin_principal) == 62, "pin_principal offset mismatch");
   static_assert(offsetof(LoRaPacket, crc) == 63, "crc offset mismatch");
 
+  // Verify 32-byte GroundStationHeader + 65-byte LoRaPacket = 97-byte USB frame
+  static_assert(sizeof(GroundStationHeader) == 32, "GroundStationHeader must be 32 bytes");
+  static_assert(sizeof(UsbTelemetryPacket) == 97, "UsbTelemetryPacket must be 97 bytes");
+  static_assert(offsetof(GroundStationHeader, gs_sync) == 0, "gs_sync offset mismatch");
+  static_assert(offsetof(GroundStationHeader, gs_flags) == 1, "gs_flags offset mismatch");
+  static_assert(offsetof(GroundStationHeader, rssi) == 2, "rssi offset mismatch");
+  static_assert(offsetof(GroundStationHeader, snr) == 4, "snr offset mismatch");
+  static_assert(offsetof(GroundStationHeader, gs_uptime_ms) == 8, "gs_uptime_ms offset mismatch");
+  static_assert(offsetof(GroundStationHeader, rx_packets) == 12, "rx_packets offset mismatch");
+  static_assert(offsetof(GroundStationHeader, rx_lost) == 16, "rx_lost offset mismatch");
+  static_assert(offsetof(GroundStationHeader, rx_crc_errors) == 20, "rx_crc_errors offset mismatch");
+  static_assert(offsetof(GroundStationHeader, rx_size_errors) == 24, "rx_size_errors offset mismatch");
+  static_assert(offsetof(GroundStationHeader, tx_reboots) == 28, "tx_reboots offset mismatch");
+  static_assert(offsetof(GroundStationHeader, gs_crc) == 30, "gs_crc offset mismatch");
+  static_assert(offsetof(UsbTelemetryPacket, rocket) == 32, "rocket offset inside UsbTelemetryPacket mismatch");
+
   // 2. Verify pinout constants match original ESP32-C3 pinout
   assert(PIN_SCK == 4 && PIN_MISO == 5 && PIN_MOSI == 6 && PIN_CS == 7);
   assert(PIN_RST == 10 && PIN_DIO0 == 3);
@@ -62,8 +78,13 @@ int main(int argc, char** argv) {
   bool sawWrapReset     = false;
 
   FILE* dumpFile = nullptr;
+  bool dumpUsb97 = false;
   if (argc >= 3 && std::strcmp(argv[1], "--dump") == 0) {
     dumpFile = std::fopen(argv[2], "wb");
+    assert(dumpFile != nullptr);
+  } else if (argc >= 3 && std::strcmp(argv[1], "--dump-usb") == 0) {
+    dumpFile  = std::fopen(argv[2], "wb");
+    dumpUsb97 = true;
     assert(dumpFile != nullptr);
   }
 
@@ -101,7 +122,24 @@ int main(int argc, char** argv) {
     }
 
     if (dumpFile != nullptr) {
-      std::fwrite(&pkt, sizeof(pkt), 1, dumpFile);
+      if (dumpUsb97) {
+        UsbTelemetryPacket usb{};
+        usb.gs.gs_sync        = GS_SYNC_BYTE;
+        usb.gs.gs_flags       = GS_PROTO_VERSION | (crcOk ? 0x01 : 0x00) | 0x02;
+        usb.gs.rssi           = -64;
+        usb.gs.snr            = 9.25f;
+        usb.gs.gs_uptime_ms   = nowMs + 500U;
+        usb.gs.rx_packets     = step + 1U;
+        usb.gs.rx_lost        = static_cast<uint32_t>(lossWindowDropped);
+        usb.gs.rx_crc_errors  = static_cast<uint32_t>(crcInvalidCycle1 + crcInvalidCycle2);
+        usb.gs.rx_size_errors = 0U;
+        usb.gs.tx_reboots     = (step >= 2900U) ? 1U : 0U;
+        usb.gs.gs_crc         = calculateCRC16(reinterpret_cast<const uint8_t*>(&usb.gs), sizeof(GroundStationHeader) - 2);
+        usb.rocket            = pkt;
+        std::fwrite(&usb, sizeof(usb), 1, dumpFile);
+      } else {
+        std::fwrite(&pkt, sizeof(pkt), 1, dumpFile);
+      }
     }
   }
 

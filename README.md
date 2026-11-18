@@ -55,10 +55,11 @@ Uses the original safe FSPI hardware pins (`4..7`) and safe control GPIOs (`3`, 
 
 ---
 
-## Switching Ground Station Mode (Human-Readable <-> PC Binary)
+## Switching Ground Station Mode (`'H'` Human-Readable <-> `'B'` 97-Byte Binary)
 
-1. **Human-Readable Debug (Default):** `HUMAN_READABLE_MODE = true` prints decoded telemetry blocks and 1 Hz `========== STATISTICS ==========` reports at `115200` baud.
-2. **Raw 65-Byte Binary Mode (`estacion-terrena-pc/main.py`):** Send `B` over Serial (or set `HUMAN_READABLE_MODE = false` in Section 1) to forward raw 65-byte `LoRaPacket` frames via `Serial.write`. Send `H` to return to Human-Readable mode.
+1. **Human-Readable Debug (`'H'`, Default on Boot):** `HUMAN_READABLE_DEFAULT = true` prints decoded telemetry blocks and 1 Hz `========== STATISTICS ==========` reports at `115200` baud.
+2. **Dashboard Binary Mode (`'B'`, Watchdog-Protected):** When `estacion-terrena-pc/main.py` connects, it automatically sends `'B'` (plus a `2.0 s` keepalive) and returns `'H'` on clean exit. The Ground Station ESP32 emits **97-byte USB frames** (`32B GroundStationHeader` starting with `0xAB` + `65B` untouched `LoRaPacket` starting with `0xAA`), delivering live `rssi`, `snr`, and RX counters (`rx_packets`, `rx_lost`, `rx_crc_errors`, `rx_size_errors`, `tx_reboots`, `gs_uptime_ms`, `gs_flags`). If the dashboard crashes or disconnects for `> 6.0 s` (`BINARY_WATCHDOG_MS`), the ESP32 automatically reverts to `'H'` mode.
+3. **Manual Sticky Binary (`'M'`):** Enters 97-byte Binary mode without the 6 s keepalive timeout until `'H'` is sent.
 
 ---
 
